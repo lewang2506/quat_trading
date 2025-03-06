@@ -31,7 +31,8 @@ class Backtest:
         data: pd.DataFrame,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        output_dir: str = '../backtest'
+        output_dir: str = 'backtest',
+        window_size: int = 1
     ):
         """
         初始化回测
@@ -42,9 +43,11 @@ class Backtest:
             start_date: 回测开始日期，格式为 'YYYY-MM-DD'
             end_date: 回测结束日期，格式为 'YYYY-MM-DD'
             output_dir: 输出目录
+            window_size: 每次更新的数据窗口大小，默认为1（逐条数据更新）
         """
         self.strategy = strategy
         self.data = data
+        self.window_size = window_size
         
         # 确保数据索引是日期类型
         if not isinstance(data.index, pd.DatetimeIndex):
@@ -79,10 +82,11 @@ class Backtest:
         if len(self.data) <= self.strategy.atr_period:
             raise ValueError(f"数据长度不足，至少需要 {self.strategy.atr_period + 1} 天")
             
-        # 按日期遍历数据
-        for i in range(self.strategy.atr_period, len(self.data)):
-            # 获取当前日期的数据窗口
-            current_window = self.data.iloc[:i+1]
+        # 遍历数据
+        for i in range(0, len(self.data), self.window_size):
+            # 获取当前窗口数据
+            end_idx = min(i + self.window_size, len(self.data))
+            current_window = self.data.iloc[i:end_idx]
             
             # 更新策略
             result = self.strategy.update(current_window)
@@ -90,11 +94,20 @@ class Backtest:
             # 记录结果
             self.results.append(result)
             
-            # 如果触发熔断，跳过当天剩余操作
+            # 如果触发熔断，记录熔断信息，但继续处理对冲资产的交易
             if result.get('status') == 'circuit_breaker_triggered':
-                logger.warning(f"日期 {current_window.index[-1]} 触发熔断，跳过当天交易")
-                # 第二天重置熔断状态
-                if i < len(self.data) - 1:
+                triggered_asset = result.get('triggered_asset')
+                logger.warning(f"日期 {current_window.index[-1]} 资产 {triggered_asset} 触发熔断，暂停该资产交易，执行反向对冲")
+                # 熔断状态已在策略中设置，不需要在这里重置
+                # 反向对冲逻辑已在策略的handle_circuit_breaker方法中处理
+            
+            # 检查是否是当天的最后一个数据点
+            current_date = current_window.index[-1].date()
+            
+            # 如果已经是最后一个数据点或者下一个窗口是新的一天，重置熔断状态
+            if end_idx >= len(self.data) or (end_idx < len(self.data) and self.data.index[end_idx].date() != current_date):
+                if self.strategy.circuit_breaker_triggered:
+                    logger.info(f"日期 {current_date} 结束，重置熔断状态")
                     self.strategy.reset_circuit_breaker()
         
         # 获取策略表现摘要
@@ -139,10 +152,20 @@ class Backtest:
             daily_return = (portfolio_values[i] - portfolio_values[i-1]) / portfolio_values[i-1]
             daily_returns.append(daily_return)
             
+        # 计算实际交易天数（使用唯一日期数量）
+        unique_dates = len(set([date.date() for date in dates]))
+        trading_days = unique_dates
+        
         # 计算年化收益率 (假设252个交易日)
-        trading_days = len(portfolio_values)
         years = trading_days / 252
         
+        # 如果交易天数太少，也可以使用实际日历天数计算
+        if years < 0.1:  # 少于约25个交易日
+            start_date = dates[0]
+            end_date = dates[-1]
+            calendar_days = (end_date - start_date).days
+            years = calendar_days / 365
+            
         if years > 0:
             annualized_return = (1 + total_return) ** (1 / years) - 1
         else:
@@ -162,8 +185,8 @@ class Backtest:
             volatility = 0
             annualized_volatility = 0
             
-        # 计算夏普比率 (假设无风险利率为0)
-        risk_free_rate = 0
+        # 计算夏普比率 (假设无风险利率为2%)
+        risk_free_rate = 0.02
         if annualized_volatility > 0:
             sharpe_ratio = (annualized_return - risk_free_rate) / annualized_volatility
         else:
@@ -337,6 +360,10 @@ class Backtest:
         dates = [result['date'] for result in self.results if 'date' in result]
         portfolio_values = [result['portfolio_value'] for result in self.results if 'portfolio_value' in result]
         
+        # 获取实际的开始和结束日期（按照日期格式化）
+        start_date = dates[0].strftime('%Y-%m-%d')
+        end_date = dates[-1].strftime('%Y-%m-%d')
+        
         # 创建图表
         plt.figure(figsize=(12, 8))
         
@@ -382,7 +409,7 @@ class Backtest:
         # 回测报告
         
         ## 基本信息
-        - 回测期间: {dates[0]} 至 {dates[-1]}
+        - 回测期间: {start_date} 至 {end_date}
         - 初始资金: {self.strategy.initial_capital}
         - 交易天数: {performance['trading_days']}
         
